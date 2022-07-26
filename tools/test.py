@@ -15,6 +15,7 @@ from mmdet.datasets import (build_dataloader, build_dataset,
                             replace_ImageToTensor)
 from mmdet.models import build_detector
 
+from backbone import *
 
 def parse_args():
     parser = argparse.ArgumentParser(
