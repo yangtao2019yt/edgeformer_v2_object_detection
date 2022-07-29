@@ -14,7 +14,7 @@ from timm.models.layers import DropPath, to_2tuple, trunc_normal_
 
 from mmcv_custom import load_checkpoint
 from mmdet.utils import get_root_logger
-from mmdet.models.builder import BACKBONES
+from ..builder import BACKBONES
 
 
 class Mlp(nn.Module):
