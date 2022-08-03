@@ -179,7 +179,7 @@ class InvertedResidual_gcc(nn.Module):
             return x
 
 
-class MobileNetV2(nn.Module):
+class MobileNetV2_GCC(nn.Module):
     def __init__(
         self,
         in_chans: int = 3,
@@ -206,7 +206,7 @@ class MobileNetV2(nn.Module):
             norm_layer: Module specifying the normalization layer to use
 
         """
-        super(MobileNetV2, self).__init__()
+        super(MobileNetV2_GCC, self).__init__()
 
         if block is None:
             block = InvertedResidual
