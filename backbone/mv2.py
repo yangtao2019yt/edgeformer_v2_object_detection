@@ -1,7 +1,10 @@
 from torch import nn
 from torch import Tensor
 from typing import Callable, Any, Optional, List
-from timm.models.registry import register_model
+
+from timm.models.layers import trunc_normal_, DropPath
+
+from ..builder import BACKBONES
 
 model_urls = {
     'mobilenet_v2': 'https://download.pytorch.org/models/mobilenet_v2-b0353104.pth',
@@ -94,7 +97,7 @@ class InvertedResidual(nn.Module):
         else:
             return self.conv(x)
 
-
+@BACKBONES.register_module()
 class MobileNetV2(nn.Module):
     def __init__(
         self,
@@ -107,7 +110,9 @@ class MobileNetV2(nn.Module):
         inverted_residual_setting: Optional[List[List[int]]] = None,
         round_nearest: int = 8,
         block: Optional[Callable[..., nn.Module]] = None,
-        norm_layer: Optional[Callable[..., nn.Module]] = None
+        norm_layer: Optional[Callable[..., nn.Module]] = None,
+        out_indices = (1, 2, 4, 7),
+        frozen_stages = -1,
     ) -> None:
         """
         MobileNet V2 main class
@@ -137,13 +142,16 @@ class MobileNetV2(nn.Module):
             inverted_residual_setting = [
                 # t, c, n, s
                 [1, 16, 1, 1],
-                [6, 24, 2, 2],
-                [6, 32, 3, 2],
+                [6, 24, 2, 2],  # out0
+                [6, 32, 3, 2],  # out1
                 [6, 64, 4, 2],
-                [6, 96, 3, 1],
+                [6, 96, 3, 1],  # out2
                 [6, 160, 3, 2],
-                [6, 320, 1, 1],
+                [6, 320, 1, 1], # out3
             ]
+
+        self.out_indices = out_indices
+        self.frozen_stages = frozen_stages
 
         # only check the first element, assuming user knows t,c,n,s are required
         if len(inverted_residual_setting) == 0 or len(inverted_residual_setting[0]) != 4:
@@ -152,25 +160,26 @@ class MobileNetV2(nn.Module):
 
         # building first layer
         input_channel = _make_divisible(input_channel * width_mult, round_nearest)
-        self.last_channel = _make_divisible(last_channel * max(1.0, width_mult), round_nearest)
-        features: List[nn.Module] = [ConvBNReLU(3, input_channel, stride=2, norm_layer=norm_layer)]
-        # building inverted residual blocks
-        for t, c, n, s in inverted_residual_setting:
-            output_channel = _make_divisible(c * width_mult, round_nearest)
-            for i in range(n):
-                stride = s if i == 0 else 1
-                features.append(block(input_channel, output_channel, stride, expand_ratio=t, norm_layer=norm_layer))
-                input_channel = output_channel
-        # building last several layers
-        features.append(ConvBNReLU(input_channel, self.last_channel, kernel_size=1, norm_layer=norm_layer))
-        # make it nn.Sequential
-        self.features = nn.Sequential(*features)
+        self.conv1 = ConvBNReLU(3, input_channel, stride=2, norm_layer=norm_layer)
+        self.layers.append('conv1')
 
-        # building classifier
-        self.classifier = nn.Sequential(
-            nn.Dropout(0.2),
-            nn.Linear(self.last_channel, num_classes),
-        )
+        # building inverted residual blocks
+        self.layers = []
+        for i, (t, c, n, s) in enumerate(inverted_residual_setting):
+            output_channel = _make_divisible(c * width_mult, round_nearest)
+            stage = []
+            for j in range(n):
+                stride = s if j == 0 else 1
+                stage.append(block(input_channel, output_channel, stride, expand_ratio=t, norm_layer=norm_layer))
+                input_channel = output_channel
+            layer_name = f'layer{i + 1}'
+            self.add_module(layer_name, nn.Sequential(*stage))
+            self.layers.append(layer_name)
+
+        # building last several layers
+        self.last_channel = _make_divisible(last_channel * max(1.0, width_mult), round_nearest)
+        self.add_module('conv2', ConvBNReLU(input_channel, self.last_channel, kernel_size=1, norm_layer=norm_layer))
+        self.layers.append('conv2')
 
         # weight initialization
         for m in self.modules():
@@ -185,31 +194,37 @@ class MobileNetV2(nn.Module):
                 nn.init.normal_(m.weight, 0, 0.01)
                 nn.init.zeros_(m.bias)
 
-    def _forward_impl(self, x: Tensor) -> Tensor:
-        # This exists since TorchScript doesn't support inheritance, so the superclass method
-        # (this one) needs to have a name other than `forward` that can be accessed in a subclass
-        x = self.features(x)
-        # Cannot use "squeeze" as batch-size can be 1 => must use reshape with x.shape[0]
-        x = nn.functional.adaptive_avg_pool2d(x, (1, 1)).reshape(x.shape[0], -1)
-        x = self.classifier(x)
-        return x
+    def _freeze_stages(self):
+        if self.frozen_stages >= 0:
+            for param in self.conv1.parameters():
+                param.requires_grad = False
+        for i in range(1, self.frozen_stages + 1):
+            layer = getattr(self, f'layer{i}')
+            layer.eval()
+            for param in layer.parameters():
+                param.requires_grad = False
 
-    def forward(self, x: Tensor) -> Tensor:
-        return self._forward_impl(x)
+    def forward(self, x):
+        """Forward function."""
+        x = self.conv1(x)
+        outs = []
+        for i, layer_name in enumerate(self.layers):
+            layer = getattr(self, layer_name)
+            x = layer(x)
+            if i in self.out_indices:
+                outs.append(x)
+        return tuple(outs)
 
+    def train(self, mode=True):
+        """Convert the model into training mode while keep normalization layer
+        frozen."""
+        super(MobileNetV2, self).train(mode)
+        self._freeze_stages()
+        if mode and self.norm_eval:
+            for m in self.modules():
+                # trick: eval have effect on BatchNorm only
+                if isinstance(m, nn.BatchNorm2d):
+                    m.eval()
 
     def get_model_size(self):
         return sum([p.numel() for p in self.parameters()])
-
-@register_model
-def mv2(pretrained: bool = False, progress: bool = True, **kwargs: Any) -> MobileNetV2:
-    """
-    Constructs a MobileNetV2 architecture from
-    `"MobileNetV2: Inverted Residuals and Linear Bottlenecks" <https://arxiv.org/abs/1801.04381>`_.
-
-    Args:
-        pretrained (bool): If True, returns a model pre-trained on ImageNet
-        progress (bool): If True, displays a progress bar of the download to stderr
-    """
-    model = MobileNetV2(**kwargs)
-    return model

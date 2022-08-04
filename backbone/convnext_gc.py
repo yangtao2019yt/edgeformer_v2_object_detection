@@ -87,14 +87,19 @@ class ConvNeXt_GC(nn.Module):
             raise TypeError('pretrained must be a str or None')
 
     def forward_features(self, x):
+        outs = []
         for i in range(4):
             x = self.downsample_layers[i](x)
             x = self.stages[i](x)
-        return self.norm(x.mean([-2, -1]))  # global average pooling, (N, C, H, W) -> (N, C)
+            if i in self.out_indices:
+                norm_layer = getattr(self, f'norm{i}')
+                x_out = norm_layer(x)
+                outs.append(x_out)
+
+        return tuple(outs)
 
     def forward(self, x):
         x = self.forward_features(x)
-        x = self.head(x)
         return x
 
     def get_model_size(self):

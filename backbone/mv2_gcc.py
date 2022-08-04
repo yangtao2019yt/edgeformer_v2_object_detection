@@ -1,14 +1,11 @@
+import torch
 from torch import nn
+import torch.nn.functional as F
 from torch import Tensor
 from typing import Callable, Any, Optional, List
-from timm.models.registry import register_model
-import torch
 from timm.models.layers import trunc_normal_, DropPath
 
-model_urls = {
-    'mobilenet_v2': 'https://download.pytorch.org/models/mobilenet_v2-b0353104.pth',
-}
-
+from ..builder import BACKBONES
 
 def _make_divisible(v: float, divisor: int, min_value: Optional[int] = None) -> int:
     """
@@ -94,16 +91,30 @@ class InvertedResidual(nn.Module):
         else:
             return self.conv(x)
 
+class _gcc_conv(nn.Module):
+    # only a bank for weight and bias
+    def __init__(self, type: str, conv2d: nn.Conv2d):
+        super(_gcc_conv, self).__init__()
+        self.groups = 1
+        self.type = type
+        self.weight, self.bias = conv2d.weight, conv2d.bias
 
 class GCC_conv(nn.Module):
-    def __init__(self, dim, type, global_kernel_size, use_pe=True):
+    def __init__(self,
+        dim,
+        type,
+        global_kernel_size,
+        use_pe = True,
+        instance_kernel_method = 'interpolation_bilinear'
+    ):
         super().__init__()
         self.type = type  # H or W
         self.dim = dim
         self.use_pe = use_pe
         self.global_kernel_size = global_kernel_size
         self.kernel_size = (global_kernel_size, 1) if self.type == 'H' else (1, global_kernel_size)
-        self.gcc_conv = nn.Conv2d(dim, dim, kernel_size=self.kernel_size, groups=dim)
+        self.gcc_conv = _gcc_conv(type, nn.Conv2d(dim, dim, kernel_size=self.kernel_size, groups=dim))
+        self.instance_kernel_method = instance_kernel_method
         if use_pe:
             if self.type=='H':
                 self.pe = nn.Parameter(torch.randn(1, dim, self.global_kernel_size, 1))
@@ -113,12 +124,12 @@ class GCC_conv(nn.Module):
             trunc_normal_(self.pe, std=.02)
 
     def forward(self, x):
-        if self.use_pe:
-            x = x + self.pe.expand(1, self.dim, self.global_kernel_size, self.global_kernel_size)
-
-        x_cat = torch.cat((x, x[:, :, :-1, :]), dim=2) if self.type == 'H' else torch.cat((x, x[:, :, :, :-1]), dim=3)
-        x = self.gcc_conv(x_cat)
-
+        _, _, H, W = x.shape
+        if self.pe is not None:
+            x = x + self.get_instance_pe((H, W))
+        weight = self.get_instance_kernel((H, W))
+        x_cat = torch.cat((x, x[:, :, :-1, :]), dim=2) if self.type=='H' else torch.cat((x, x[:, :, :, :-1]), dim=3)
+        x = F.conv2d(x_cat, weight=weight, bias=self.gcc_conv.bias, padding=0, groups=1)
         return x
 
 
@@ -178,7 +189,7 @@ class InvertedResidual_gcc(nn.Module):
         else:
             return x
 
-
+@BACKBONES.register_module()
 class MobileNetV2_GCC(nn.Module):
     def __init__(
         self,
@@ -191,7 +202,9 @@ class MobileNetV2_GCC(nn.Module):
         inverted_residual_setting: Optional[List[List[int]]] = None,
         round_nearest: int = 8,
         block: Optional[Callable[..., nn.Module]] = None,
-        norm_layer: Optional[Callable[..., nn.Module]] = None
+        norm_layer: Optional[Callable[..., nn.Module]] = None,
+        out_indices = (1, 2, 4, 7),
+        frozen_stages = -1,
     ) -> None:
         """
         MobileNet V2 main class
@@ -221,13 +234,16 @@ class MobileNetV2_GCC(nn.Module):
             inverted_residual_setting = [
                 # t, c, n, s, gcc, r
                 [1, 16, 1, 1, 1, 112],
-                [6, 24, 2, 2, 2, 56],
-                [6, 32, 3, 2, 3, 28],
+                [6, 24, 2, 2, 2, 56], # out0
+                [6, 32, 3, 2, 3, 28], # out1
                 [6, 64, 4, 2, 2, 14],
-                [6, 96, 3, 1, 2, 14],
+                [6, 96, 3, 1, 2, 14], # out2
                 [6, 160, 3, 2, 2, 7],
-                [6, 320, 1, 1, 1, 7],
+                [6, 320, 1, 1, 1, 7], # out3
             ]
+
+        self.out_indices = out_indices
+        self.frozen_stages = frozen_stages
 
         # only check the first element, assuming user knows t,c,n,s are required
         if len(inverted_residual_setting) == 0 or len(inverted_residual_setting[0]) != 6:
@@ -236,30 +252,31 @@ class MobileNetV2_GCC(nn.Module):
 
         # building first layer
         input_channel = _make_divisible(input_channel * width_mult, round_nearest)
-        self.last_channel = _make_divisible(last_channel * max(1.0, width_mult), round_nearest)
-        features: List[nn.Module] = [ConvBNReLU(3, input_channel, stride=2, norm_layer=norm_layer)]
+        self.conv1 = ConvBNReLU(3, input_channel, stride=2, norm_layer=norm_layer)
+        self.layers.append('conv1')
+
         # building inverted residual blocks
-        for t, c, n, s, gcc, r in inverted_residual_setting:
+        self.layers = []
+        for i, (t, c, n, s, gcc, r) in enumerate(inverted_residual_setting):
             output_channel = _make_divisible(c * width_mult, round_nearest)
+            stage = []
             for i in range(n):
                 stride = s if i == 0 else 1
                 if i < gcc:
-                    features.append(block(input_channel, output_channel, stride, expand_ratio=t, norm_layer=norm_layer))
+                    stage.append(block(input_channel, output_channel, stride, expand_ratio=t, norm_layer=norm_layer))
                 else:
-                    features.append(InvertedResidual_gcc(input_channel, output_channel, stride, expand_ratio=t,
+                    stage.append(InvertedResidual_gcc(input_channel, output_channel, stride, expand_ratio=t,
                                                          norm_layer=norm_layer, global_kernel_size=r,
                                                          use_pe=True if i == gcc else False))
-                input_channel = output_channel
-        # building last several layers
-        features.append(ConvBNReLU(input_channel, self.last_channel, kernel_size=1, norm_layer=norm_layer))
-        # make it nn.Sequential
-        self.features = nn.Sequential(*features)
+            input_channel = output_channel
+            layer_name = f'layer{i + 1}'
+            self.add_module(layer_name, nn.Sequential(*stage))
+            self.layers.append(layer_name)
 
-        # building classifier
-        self.classifier = nn.Sequential(
-            nn.Dropout(0.2),
-            nn.Linear(self.last_channel, num_classes),
-        )
+        # building last several layers
+        self.last_channel = _make_divisible(last_channel * max(1.0, width_mult), round_nearest)
+        self.add_module('conv2', ConvBNReLU(input_channel, self.last_channel, kernel_size=1, norm_layer=norm_layer))
+        self.layers.append('conv2')
 
         # weight initialization
         for m in self.modules():
@@ -274,34 +291,37 @@ class MobileNetV2_GCC(nn.Module):
                 nn.init.normal_(m.weight, 0, 0.01)
                 nn.init.zeros_(m.bias)
 
-    def _forward_impl(self, x: Tensor) -> Tensor:
-        # This exists since TorchScript doesn't support inheritance, so the superclass method
-        # (this one) needs to have a name other than `forward` that can be accessed in a subclass
-        x = self.features(x)
-        # Cannot use "squeeze" as batch-size can be 1 => must use reshape with x.shape[0]
-        x = nn.functional.adaptive_avg_pool2d(x, (1, 1)).reshape(x.shape[0], -1)
-        x = self.classifier(x)
-        return x
+    def _freeze_stages(self):
+        if self.frozen_stages >= 0:
+            for param in self.conv1.parameters():
+                param.requires_grad = False
+        for i in range(1, self.frozen_stages + 1):
+            layer = getattr(self, f'layer{i}')
+            layer.eval()
+            for param in layer.parameters():
+                param.requires_grad = False
 
-    def forward(self, x: Tensor) -> Tensor:
-        return self._forward_impl(x)
+    def forward(self, x):
+        """Forward function."""
+        x = self.conv1(x)
+        outs = []
+        for i, layer_name in enumerate(self.layers):
+            layer = getattr(self, layer_name)
+            x = layer(x)
+            if i in self.out_indices:
+                outs.append(x)
+        return tuple(outs)
 
+    def train(self, mode=True):
+        """Convert the model into training mode while keep normalization layer
+        frozen."""
+        super(MobileNetV2_GCC, self).train(mode)
+        self._freeze_stages()
+        if mode and self.norm_eval:
+            for m in self.modules():
+                # trick: eval have effect on BatchNorm only
+                if isinstance(m, nn.BatchNorm2d):
+                    m.eval()
 
     def get_model_size(self):
         return sum([p.numel() for p in self.parameters()])
-
-@register_model
-def mv2_gcc(pretrained: bool = False, progress: bool = True, **kwargs: Any) -> MobileNetV2:
-    """
-    Constructs a MobileNetV2 architecture from
-    `"MobileNetV2: Inverted Residuals and Linear Bottlenecks" <https://arxiv.org/abs/1801.04381>`_.
-
-    Args:
-        pretrained (bool): If True, returns a model pre-trained on ImageNet
-        progress (bool): If True, displays a progress bar of the download to stderr
-    """
-    model = MobileNetV2(**kwargs)
-    # test
-    input = torch.randn(2, 3, 224, 224)
-    out = model(input)
-    return model
