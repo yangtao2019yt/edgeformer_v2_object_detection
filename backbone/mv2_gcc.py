@@ -3,9 +3,13 @@ from torch import nn
 import torch.nn.functional as F
 from torch import Tensor
 from typing import Callable, Any, Optional, List
-from timm.models.layers import trunc_normal_, DropPath
+from timm.models.layers import trunc_normal_
 
-from ..builder import BACKBONES
+from mmcv_custom import load_checkpoint
+from mmdet.utils import get_root_logger
+from mmdet.models.builder import BACKBONES
+
+from mmcv.cnn import constant_init, kaiming_init
 
 def _make_divisible(v: float, divisor: int, min_value: Optional[int] = None) -> int:
     """
@@ -253,7 +257,6 @@ class MobileNetV2_GCC(nn.Module):
         # building first layer
         input_channel = _make_divisible(input_channel * width_mult, round_nearest)
         self.conv1 = ConvBNReLU(3, input_channel, stride=2, norm_layer=norm_layer)
-        self.layers.append('conv1')
 
         # building inverted residual blocks
         self.layers = []
@@ -278,19 +281,6 @@ class MobileNetV2_GCC(nn.Module):
         self.add_module('conv2', ConvBNReLU(input_channel, self.last_channel, kernel_size=1, norm_layer=norm_layer))
         self.layers.append('conv2')
 
-        # weight initialization
-        for m in self.modules():
-            if isinstance(m, nn.Conv2d):
-                nn.init.kaiming_normal_(m.weight, mode='fan_out')
-                if m.bias is not None:
-                    nn.init.zeros_(m.bias)
-            elif isinstance(m, (nn.BatchNorm2d, nn.GroupNorm)):
-                nn.init.ones_(m.weight)
-                nn.init.zeros_(m.bias)
-            elif isinstance(m, nn.Linear):
-                nn.init.normal_(m.weight, 0, 0.01)
-                nn.init.zeros_(m.bias)
-
     def _freeze_stages(self):
         if self.frozen_stages >= 0:
             for param in self.conv1.parameters():
@@ -300,6 +290,31 @@ class MobileNetV2_GCC(nn.Module):
             layer.eval()
             for param in layer.parameters():
                 param.requires_grad = False
+
+    def init_weights(self, pretrained=None):
+        """Initialize the weights in backbone.
+
+        Args:
+            pretrained (str, optional): Path to pre-trained weights.
+                Defaults to None.
+        """
+        if isinstance(pretrained, str):
+            logger = get_root_logger()
+            load_checkpoint(self, pretrained, strict=False, logger=logger)
+        elif pretrained is None:
+            for m in self.modules():
+                if isinstance(m, nn.Conv2d):
+                    nn.init.kaiming_normal_(m.weight, mode='fan_out')
+                    if m.bias is not None:
+                        nn.init.zeros_(m.bias)
+                elif isinstance(m, (nn.BatchNorm2d, nn.GroupNorm)):
+                    nn.init.ones_(m.weight)
+                    nn.init.zeros_(m.bias)
+                elif isinstance(m, nn.Linear):
+                    nn.init.normal_(m.weight, 0, 0.01)
+                    nn.init.zeros_(m.bias)
+        else:
+            raise TypeError('pretrained must be a str or None')
 
     def forward(self, x):
         """Forward function."""
