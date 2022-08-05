@@ -194,7 +194,7 @@ class InvertedResidual_gcc(nn.Module):
             return x
 
 @BACKBONES.register_module()
-class MobileNetV2_GCC(nn.Module):
+class _MobileNetV2_GCC(nn.Module):
     def __init__(
         self,
         in_chans: int = 3,
@@ -209,6 +209,7 @@ class MobileNetV2_GCC(nn.Module):
         norm_layer: Optional[Callable[..., nn.Module]] = None,
         out_indices = (1, 2, 4, 7),
         frozen_stages = -1,
+        norm_eval=False,
     ) -> None:
         """
         MobileNet V2 main class
@@ -223,7 +224,7 @@ class MobileNetV2_GCC(nn.Module):
             norm_layer: Module specifying the normalization layer to use
 
         """
-        super(MobileNetV2_GCC, self).__init__()
+        super(_MobileNetV2_GCC, self).__init__()
 
         if block is None:
             block = InvertedResidual
@@ -248,6 +249,7 @@ class MobileNetV2_GCC(nn.Module):
 
         self.out_indices = out_indices
         self.frozen_stages = frozen_stages
+        self.norm_eval = norm_eval
 
         # only check the first element, assuming user knows t,c,n,s are required
         if len(inverted_residual_setting) == 0 or len(inverted_residual_setting[0]) != 6:
@@ -263,15 +265,15 @@ class MobileNetV2_GCC(nn.Module):
         for i, (t, c, n, s, gcc, r) in enumerate(inverted_residual_setting):
             output_channel = _make_divisible(c * width_mult, round_nearest)
             stage = []
-            for i in range(n):
+            for j in range(n):
                 stride = s if i == 0 else 1
-                if i < gcc:
+                if j < gcc:
                     stage.append(block(input_channel, output_channel, stride, expand_ratio=t, norm_layer=norm_layer))
                 else:
                     stage.append(InvertedResidual_gcc(input_channel, output_channel, stride, expand_ratio=t,
                                                          norm_layer=norm_layer, global_kernel_size=r,
-                                                         use_pe=True if i == gcc else False))
-            input_channel = output_channel
+                                                         use_pe=True if j == gcc else False))
+                input_channel = output_channel
             layer_name = f'layer{i + 1}'
             self.add_module(layer_name, nn.Sequential(*stage))
             self.layers.append(layer_name)
@@ -330,7 +332,7 @@ class MobileNetV2_GCC(nn.Module):
     def train(self, mode=True):
         """Convert the model into training mode while keep normalization layer
         frozen."""
-        super(MobileNetV2_GCC, self).train(mode)
+        super(_MobileNetV2_GCC, self).train(mode)
         self._freeze_stages()
         if mode and self.norm_eval:
             for m in self.modules():

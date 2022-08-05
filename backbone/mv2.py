@@ -100,7 +100,7 @@ class InvertedResidual(nn.Module):
             return self.conv(x)
 
 @BACKBONES.register_module()
-class MobileNetV2(nn.Module):
+class _MobileNetV2(nn.Module):
     def __init__(
         self,
         in_chans: int = 3,
@@ -115,6 +115,7 @@ class MobileNetV2(nn.Module):
         norm_layer: Optional[Callable[..., nn.Module]] = None,
         out_indices = (1, 2, 4, 7),
         frozen_stages = -1,
+        norm_eval=False,
     ) -> None:
         """
         MobileNet V2 main class
@@ -129,7 +130,7 @@ class MobileNetV2(nn.Module):
             norm_layer: Module specifying the normalization layer to use
 
         """
-        super(MobileNetV2, self).__init__()
+        super(_MobileNetV2, self).__init__()
 
         if block is None:
             block = InvertedResidual
@@ -154,6 +155,7 @@ class MobileNetV2(nn.Module):
 
         self.out_indices = out_indices
         self.frozen_stages = frozen_stages
+        self.norm_eval = norm_eval
 
         # only check the first element, assuming user knows t,c,n,s are required
         if len(inverted_residual_setting) == 0 or len(inverted_residual_setting[0]) != 4:
@@ -231,7 +233,7 @@ class MobileNetV2(nn.Module):
     def train(self, mode=True):
         """Convert the model into training mode while keep normalization layer
         frozen."""
-        super(MobileNetV2, self).train(mode)
+        super(_MobileNetV2, self).train(mode)
         self._freeze_stages()
         if mode and self.norm_eval:
             for m in self.modules():
