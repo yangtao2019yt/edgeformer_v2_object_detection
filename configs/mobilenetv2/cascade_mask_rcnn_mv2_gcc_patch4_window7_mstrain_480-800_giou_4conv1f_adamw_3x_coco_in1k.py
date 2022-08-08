@@ -20,9 +20,9 @@ model = dict(
         block=None, # use default settings
         norm_layer=None, # use default settings
         out_indices=(1, 2, 4, 7),
-        frozen_stages=1,
+        frozen_stages=-1,
     ),
-    neck=dict(in_channels=[24, 32, 96, 320]),
+    neck=dict(in_channels=[24, 32, 96, 1280]),
     roi_head=dict(
         bbox_head=[
             dict(

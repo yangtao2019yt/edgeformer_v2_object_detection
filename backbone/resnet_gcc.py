@@ -157,6 +157,8 @@ class GCC_conv(nn.Module):
             elif self.type=='W':
                 self.pe = nn.Parameter(torch.randn(1, dim, 1, self.global_kernel_size))
             trunc_normal_(self.pe, std=.02)
+        else:
+            self.pe = None
 
     def get_instance_kernel(self, instance_kernel_size_2):
         # if no use of dynamic resolution, keep a static kernel

@@ -114,7 +114,6 @@ class GCC_conv(nn.Module):
         super().__init__()
         self.type = type  # H or W
         self.dim = dim
-        self.use_pe = use_pe
         self.global_kernel_size = global_kernel_size
         self.kernel_size = (global_kernel_size, 1) if self.type == 'H' else (1, global_kernel_size)
         self.gcc_conv = _gcc_conv(type, nn.Conv2d(dim, dim, kernel_size=self.kernel_size, groups=dim))
@@ -126,6 +125,8 @@ class GCC_conv(nn.Module):
             elif self.type=='W':
                 self.pe = nn.Parameter(torch.randn(1, dim, 1, self.global_kernel_size))
             trunc_normal_(self.pe, std=.02)
+        else:
+            self.pe = None
 
     def get_instance_kernel(self, instance_kernel_size_2):
         # if no use of dynamic resolution, keep a static kernel
@@ -149,9 +150,8 @@ class GCC_conv(nn.Module):
             x = x + self.get_instance_pe((H, W))
         weight = self.get_instance_kernel((H, W))
         x_cat = torch.cat((x, x[:, :, :-1, :]), dim=2) if self.type=='H' else torch.cat((x, x[:, :, :, :-1]), dim=3)
-        x = F.conv2d(x_cat, weight=weight, bias=self.gcc_conv.bias, padding=0, groups=1)
+        x = F.conv2d(x_cat, weight=weight, bias=self.gcc_conv.bias, padding=0, groups=self.dim)
         return x
-
 
 class InvertedResidual_gcc(nn.Module):
     def __init__(
@@ -282,7 +282,7 @@ class _MobileNetV2_GCC(nn.Module):
             output_channel = _make_divisible(c * width_mult, round_nearest)
             stage = []
             for j in range(n):
-                stride = s if i == 0 else 1
+                stride = s if j == 0 else 1
                 if j < gcc:
                     stage.append(block(input_channel, output_channel, stride, expand_ratio=t, norm_layer=norm_layer))
                 else:
