@@ -127,6 +127,22 @@ class GCC_conv(nn.Module):
                 self.pe = nn.Parameter(torch.randn(1, dim, 1, self.global_kernel_size))
             trunc_normal_(self.pe, std=.02)
 
+    def get_instance_kernel(self, instance_kernel_size_2):
+        # if no use of dynamic resolution, keep a static kernel
+        if self.instance_kernel_method is None:
+            return  self.gcc_conv.weight
+        elif self.instance_kernel_method == 'interpolation_bilinear':
+            instance_kernel_size_2 =  (instance_kernel_size_2[0], 1) if self.type=='H' else (1, instance_kernel_size_2[1])
+            return  F.interpolate(self.gcc_conv.weight, instance_kernel_size_2, mode='bilinear', align_corners=True)
+    
+    def get_instance_pe(self, instance_kernel_size_2):
+        # if no use of dynamic resolution, keep a static kernel
+        if self.instance_kernel_method is None:
+            return  self.pe
+        elif self.instance_kernel_method == 'interpolation_bilinear':
+            return  F.interpolate(self.pe, instance_kernel_size_2, mode='bilinear', align_corners=True)\
+                        .expand(1, self.dim, *instance_kernel_size_2)
+
     def forward(self, x):
         _, _, H, W = x.shape
         if self.pe is not None:
